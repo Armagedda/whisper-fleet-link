@@ -1,9 +1,13 @@
 import { useState, useEffect } from 'react';
 import { ChannelSidebar } from './ChannelSidebar';
 import { VoiceChannel } from './VoiceChannel';
-import { AuthScreen } from './AuthScreen';
+import { Authentication } from './Authentication';
+import { ChannelManagement } from './ChannelManagement';
+import { AdminPanel } from './AdminPanel';
 import { useVoiceConnection } from '@/hooks/useVoiceConnection';
 import { useToast } from '@/hooks/use-toast';
+import { Button } from '@/components/ui/button';
+import { Settings, Shield, LogOut } from 'lucide-react';
 
 interface Channel {
   id: string;
@@ -22,13 +26,24 @@ interface ChannelGroup {
 }
 
 interface AuthData {
+  id: string;
   username: string;
+  email: string;
+  roles: string[];
   token: string;
-  serverUrl: string;
+  refreshToken: string;
+  channels: string[];
+  permissions: {
+    canCreateChannels: boolean;
+    canModerate: boolean;
+    isAdmin: boolean;
+    isOwner: boolean;
+  };
 }
 
 export const VoiceApp = () => {
   const [authData, setAuthData] = useState<AuthData | null>(null);
+  const [currentView, setCurrentView] = useState<'voice' | 'channels' | 'admin'>('voice');
   const [activeChannelId, setActiveChannelId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -59,9 +74,8 @@ export const VoiceApp = () => {
     }
   ]);
 
-  // Voice connection hook
   const voiceConnection = useVoiceConnection({
-    serverUrl: authData?.serverUrl || 'localhost:8080',
+    serverUrl: 'localhost:8080',
     token: authData?.token || '',
     onUserJoined: (user) => {
       toast({
@@ -84,7 +98,6 @@ export const VoiceApp = () => {
     }
   });
 
-  // Update channel user counts based on voice connection data
   const updateChannelUserCounts = () => {
     setChannelGroups(prev => prev.map(group => ({
       ...group,
@@ -95,38 +108,17 @@ export const VoiceApp = () => {
     })));
   };
 
-  // Update user counts when users change
   useEffect(() => {
     updateChannelUserCounts();
   }, [voiceConnection.users]);
 
-  const handleLogin = async (username: string, token: string) => {
-    setIsLoading(true);
-    setAuthError(null);
-    
-    try {
-      // In a real app, you'd validate the token with your backend here
-      const authData = {
-        username,
-        token,
-        serverUrl: 'localhost:8080' // This could be configurable
-      };
-      
-      setAuthData(authData);
-      
-      // Connect to voice server
-      setTimeout(() => {
-        toast({
-          title: 'Connected',
-          description: 'Successfully connected to voice server',
-        });
-        setIsLoading(false);
-      }, 1000);
-      
-    } catch (error) {
-      setAuthError('Failed to connect to server');
-      setIsLoading(false);
-    }
+  const handleAuthenticated = (user: AuthData) => {
+    setAuthData(user);
+    setIsLoading(false);
+    toast({
+      title: 'Connected',
+      description: 'Successfully authenticated to voice server',
+    });
   };
 
   const handleChannelSelect = (channelId: string) => {
@@ -183,11 +175,10 @@ export const VoiceApp = () => {
     }
   }, [authData, voiceConnection.connect, voiceConnection.state.isConnected]);
 
-  // Show auth screen if not logged in
   if (!authData) {
     return (
-      <AuthScreen
-        onLogin={handleLogin}
+      <Authentication
+        onAuthenticated={handleAuthenticated}
         isLoading={isLoading}
         error={authError}
       />
