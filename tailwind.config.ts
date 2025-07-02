@@ -52,6 +52,23 @@ export default {
 					DEFAULT: 'hsl(var(--card))',
 					foreground: 'hsl(var(--card-foreground))'
 				},
+				// Voice communication specific colors
+				voice: {
+					active: 'hsl(var(--voice-active))',
+					speaking: 'hsl(var(--voice-speaking))',
+					muted: 'hsl(var(--voice-muted))',
+					deafened: 'hsl(var(--voice-deafened))'
+				},
+				status: {
+					online: 'hsl(var(--online))',
+					idle: 'hsl(var(--idle))',
+					dnd: 'hsl(var(--dnd))',
+					offline: 'hsl(var(--offline))'
+				},
+				channel: {
+					voice: 'hsl(var(--channel-voice))',
+					text: 'hsl(var(--channel-text))'
+				},
 				sidebar: {
 					DEFAULT: 'hsl(var(--sidebar-background))',
 					foreground: 'hsl(var(--sidebar-foreground))',
