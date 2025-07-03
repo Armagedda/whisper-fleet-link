@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Volume2, VolumeOff, Mic, MicOff } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { AnimatePresence, motion } from 'framer-motion';
 
 interface User {
   id: string;
@@ -44,7 +45,13 @@ export const VoiceChannel = ({
   const otherUsers = users.filter(user => user.id !== currentUserId);
 
   return (
-    <div className="flex flex-col h-full bg-background">
+    <motion.div
+      initial={{ opacity: 0, y: 24 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: 24 }}
+      transition={{ duration: 0.4, type: 'spring' }}
+      className="flex flex-col h-full bg-gradient-to-br from-zinc-900/80 via-zinc-800/80 to-zinc-900/90 backdrop-blur-xl rounded-xl shadow-2xl border border-border"
+    >
       {/* Channel Header */}
       <div className="flex items-center justify-between p-4 border-b border-border">
         <div className="flex items-center gap-3">
@@ -139,30 +146,27 @@ export const VoiceChannel = ({
           )}
         </div>
       )}
-    </div>
+    </motion.div>
   );
 };
 
 const UserItem = ({ user, isCurrentUser }: { user: User; isCurrentUser: boolean }) => {
   return (
-    <div className={cn(
-      "flex items-center gap-3 p-2 rounded-lg",
-      user.isSpeaking && "bg-voice-active/10 border border-voice-active/20"
-    )}>
-      {/* Status Indicator */}
-      <div className="relative">
-        <div className={cn(
-          "w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium",
-          user.isOnline ? "bg-status-online" : "bg-status-offline"
-        )}>
-          {user.username.charAt(0).toUpperCase()}
-        </div>
-        
-        {/* Speaking Ring */}
-        {user.isSpeaking && (
-          <div className="absolute -inset-1 rounded-full border-2 border-voice-speaking animate-pulse"></div>
-        )}
-      </div>
+    <motion.div
+      initial={{ opacity: 0, y: 16 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: 16 }}
+      transition={{ type: 'spring', duration: 0.3 }}
+      className={cn(
+        "flex items-center gap-3 p-2 rounded-lg",
+        user.isSpeaking && "bg-voice-active/10 border border-voice-active/20 shadow-lg",
+        user.isSpeaking && "ring-2 ring-primary/60 animate-pulse"
+      )}
+    >
+      {/* Profile initials in colored circle */}
+      <span className="w-8 h-8 rounded-full flex items-center justify-center font-bold text-white bg-gradient-to-br from-primary to-secondary shadow-inner">
+        {user.username.charAt(0).toUpperCase()}
+      </span>
 
       {/* Username */}
       <div className="flex-1">
@@ -188,6 +192,6 @@ const UserItem = ({ user, isCurrentUser }: { user: User; isCurrentUser: boolean 
           </div>
         )}
       </div>
-    </div>
+    </motion.div>
   );
 };

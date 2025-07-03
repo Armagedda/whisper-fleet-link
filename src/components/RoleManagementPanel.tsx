@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Crown, Shield, User, Loader2, AlertTriangle } from "lucide-react";
+import { AnimatePresence, motion } from 'framer-motion';
 
 interface User {
   id: string;
@@ -37,6 +38,7 @@ const RoleManagementPanel: React.FC<RoleManagementPanelProps> = ({
   const [showKickDialog, setShowKickDialog] = React.useState<{ userId: string; username: string } | null>(null);
   const [showBanDialog, setShowBanDialog] = React.useState<{ userId: string; username: string } | null>(null);
   const [banReason, setBanReason] = React.useState("");
+  const [loading, setLoading] = React.useState(false);
 
   const currentUser = users.find(u => u.id === currentUserId);
   const canManageRoles = currentUser && ["owner", "moderator"].includes(currentUser.role);
@@ -123,100 +125,120 @@ const RoleManagementPanel: React.FC<RoleManagementPanelProps> = ({
   };
 
   return (
-    <Card>
+    <Card className="rounded-xl shadow-lg bg-gradient-to-br from-zinc-800/60 to-zinc-900/80 backdrop-blur-lg border border-border p-4 sm:p-6">
       <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Shield className="h-5 w-5" />
-          Role Management
-        </CardTitle>
+        <CardTitle className="flex items-center gap-2 text-lg font-bold text-foreground"> <Shield className="h-5 w-5" /> Role Management </CardTitle>
       </CardHeader>
       <CardContent>
         {error && (
-          <div className="mb-4 flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <div className="mb-4 flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm font-medium text-destructive" role="alert">
             <AlertTriangle className="h-4 w-4" />
             {error}
           </div>
         )}
-
-        <div className="border rounded-md">
-          <Table>
+        <div className="border rounded-md overflow-x-auto">
+          <Table className="min-w-full text-sm">
             <TableHeader>
               <TableRow>
-                <TableHead>User</TableHead>
-                <TableHead>Role</TableHead>
-                <TableHead className="w-[200px]">Actions</TableHead>
+                <TableHead className="font-semibold">User</TableHead>
+                <TableHead className="font-semibold">Role</TableHead>
+                <TableHead className="w-[200px] font-semibold">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {users.map((user) => {
-                const isLoading = loadingUserId === user.id;
-                const isCurrentUser = user.id === currentUserId;
-                
-                return (
-                  <TableRow key={user.id} className={isCurrentUser ? "bg-muted/50" : ""}>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium">{user.username}</span>
-                        {isCurrentUser && <Badge variant="outline">You</Badge>}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        {roleInfo[user.role].icon}
-                        {roleInfo[user.role].badge}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        {canChangeRole(user) && (
-                          <Select
-                            value={user.role}
-                            onValueChange={(value: "owner" | "moderator" | "member") => 
-                              handleRoleChange(user.id, value)
-                            }
-                            disabled={isLoading}
-                          >
-                            <SelectTrigger className="w-32">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="member">Member</SelectItem>
-                              <SelectItem value="moderator">Moderator</SelectItem>
-                              <SelectItem value="owner">Owner</SelectItem>
-                            </SelectContent>
-                          </Select>
-                        )}
-                        
-                        {canKickUser(user) && (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => setShowKickDialog({ userId: user.id, username: user.username })}
-                            disabled={isLoading}
-                          >
-                            Kick
-                          </Button>
-                        )}
-                        
-                        {canBanUser(user) && (
-                          <Button
-                            size="sm"
-                            variant="destructive"
-                            onClick={() => setShowBanDialog({ userId: user.id, username: user.username })}
-                            disabled={isLoading}
-                          >
-                            Ban
-                          </Button>
-                        )}
-                        
-                        {isLoading && (
-                          <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-                        )}
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
+              <AnimatePresence>
+                {loading ? (
+                  <motion.tr
+                    key="shimmer"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="h-12 bg-gradient-to-br from-zinc-800/60 to-zinc-900/80 animate-pulse"
+                  >
+                    <td colSpan={3}></td>
+                  </motion.tr>
+                ) : (
+                  users.map((user) => {
+                    const isLoading = loadingUserId === user.id;
+                    const isCurrentUser = user.id === currentUserId;
+                    return (
+                      <motion.tr
+                        key={user.id}
+                        initial={{ opacity: 0, y: 16 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: 16, backgroundColor: '#f87171' }}
+                        whileHover={{ scale: 1.01, boxShadow: '0 0 0 2px #818cf8, 0 4px 24px 0 #0002' }}
+                        transition={{ type: 'spring', duration: 0.3 }}
+                        className={isCurrentUser ? "bg-muted/50" : "hover:bg-muted/30 focus-within:bg-muted/40"}
+                      >
+                        <TableCell>
+                          <div className="flex items-center gap-2">
+                            <span className="w-8 h-8 rounded-full flex items-center justify-center font-bold text-white bg-gradient-to-br from-primary to-secondary shadow-inner">
+                              {user.username.charAt(0).toUpperCase()}
+                            </span>
+                            <span className="font-medium">{user.username}</span>
+                            {isCurrentUser && <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium bg-primary/10 text-primary border border-primary/20 ml-2">You</span>}
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-2">
+                            {roleInfo[user.role].icon}
+                            <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium bg-secondary/10 text-secondary border border-secondary/20">
+                              {roleInfo[user.role].label}
+                            </span>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-2">
+                            {canChangeRole(user) && (
+                              <Select
+                                value={user.role}
+                                onValueChange={(value: "owner" | "moderator" | "member") => handleRoleChange(user.id, value)}
+                                disabled={isLoading}
+                                aria-label={`Change role for ${user.username}`}
+                                tabIndex={0}
+                              >
+                                <SelectTrigger className="w-32" aria-label={`Role select for ${user.username}`}> <SelectValue /> </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="member">Member</SelectItem>
+                                  <SelectItem value="moderator">Moderator</SelectItem>
+                                  <SelectItem value="owner">Owner</SelectItem>
+                                </SelectContent>
+                              </Select>
+                            )}
+                            {canKickUser(user) && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => setShowKickDialog({ userId: user.id, username: user.username })}
+                                disabled={isLoading}
+                                aria-label={`Kick ${user.username}`}
+                                className="rounded-lg focus:ring-2 focus:ring-primary/50"
+                                tabIndex={0}
+                              >
+                                {isLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Kick'}
+                              </Button>
+                            )}
+                            {canBanUser(user) && (
+                              <Button
+                                size="sm"
+                                variant="destructive"
+                                onClick={() => setShowBanDialog({ userId: user.id, username: user.username })}
+                                disabled={isLoading}
+                                aria-label={`Ban ${user.username}`}
+                                className="rounded-lg focus:ring-2 focus:ring-primary/50"
+                                tabIndex={0}
+                              >
+                                {isLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Ban'}
+                              </Button>
+                            )}
+                          </div>
+                        </TableCell>
+                      </motion.tr>
+                    );
+                  })
+                )}
+              </AnimatePresence>
             </TableBody>
           </Table>
         </div>

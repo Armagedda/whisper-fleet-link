@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Button } from './ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
@@ -6,8 +6,10 @@ import { Slider } from './ui/slider';
 import { Badge } from './ui/badge';
 import { Progress } from './ui/progress';
 import { Alert, AlertDescription } from './ui/alert';
-import { Mic, MicOff, Volume2, VolumeX, Settings, Wifi, WifiOff, AlertCircle } from 'lucide-react';
+import { Checkbox } from './ui/checkbox';
+import { Mic, MicOff, Volume2, VolumeX, Settings, Wifi, WifiOff, AlertCircle, Activity, Gauge } from 'lucide-react';
 import { useUdpVoiceStream, UdpConnectionStatus } from '../hooks/useUdpVoiceStream';
+import { AnimatePresence, motion } from 'framer-motion';
 
 interface UdpVoiceControlsProps {
   jwtToken: string;
@@ -17,7 +19,7 @@ interface UdpVoiceControlsProps {
   serverPort?: number;
 }
 
-export function UdpVoiceControls({
+export const UdpVoiceControls = React.memo(function UdpVoiceControls({
   jwtToken,
   userId,
   channelId,
@@ -40,6 +42,18 @@ export function UdpVoiceControls({
     enableAutomaticGainControl: true,
     reconnectInterval: 5000,
     heartbeatInterval: 30000,
+    // VAD Configuration
+    enableVAD: true,
+    vadThreshold: 0.1,
+    vadSilenceTimeout: 500,
+    // Adaptive Bitrate Configuration
+    enableAdaptiveBitrate: true,
+    maxBitrate: 128000,
+    minBitrate: 16000,
+    bitrateAdjustmentInterval: 5000,
+    packetLossThreshold: 5,
+    jitterThreshold: 50,
+    stabilityTimeout: 5000,
   });
 
   // Update volume when state changes
@@ -73,6 +87,27 @@ export function UdpVoiceControls({
     }
   };
 
+  const formatBitrate = (bitrate: number) => {
+    if (bitrate >= 1000) {
+      return `${(bitrate / 1000).toFixed(1)} kbps`;
+    }
+    return `${bitrate} bps`;
+  };
+
+  // 2. Memoize derived lists and handlers
+  const remoteUserList = useMemo(() => Object.entries(state.remoteUsers), [state.remoteUsers]);
+  const handleSetVolume = useCallback((v: number) => setVolume(v), []);
+
+  // 3. Throttle/debounce slider events
+  function useDebouncedCallback<T extends (...args: any[]) => void>(fn: T, delay: number) {
+    const timeout = React.useRef<number | null>(null);
+    return useCallback((...args: Parameters<T>) => {
+      if (timeout.current) window.clearTimeout(timeout.current);
+      timeout.current = window.setTimeout(() => fn(...args), delay);
+    }, [fn, delay]);
+  }
+  const debouncedSetVolume = useDebouncedCallback(controls.setVolume, 30);
+
   return (
     <div className="space-y-4">
       {/* Connection Status */}
@@ -81,12 +116,7 @@ export function UdpVoiceControls({
           <CardTitle className="flex items-center gap-2">
             {getStatusIcon(state.status)}
             Voice Connection
-            <Badge 
-              variant={state.status === UdpConnectionStatus.Connected ? 'default' : 'secondary'}
-              className={`${getStatusColor(state.status)} text-white`}
-            >
-              {state.status}
-            </Badge>
+            <span className={`badge ${getStatusColor(state.status)} text-white`}>{state.status}</span>
           </CardTitle>
           <CardDescription>
             UDP audio streaming for real-time voice communication
@@ -136,7 +166,7 @@ export function UdpVoiceControls({
                   {Math.round(state.audioLevel * 100)}%
                 </span>
               </div>
-              <Progress value={state.audioLevel * 100} className="h-2" />
+              <AudioLevelRing level={state.audioLevel} />
             </div>
           )}
 
@@ -150,6 +180,14 @@ export function UdpVoiceControls({
               <div>
                 <span className="text-muted-foreground">Packet Loss:</span>
                 <span className="ml-2">{state.packetLoss}%</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Jitter:</span>
+                <span className="ml-2">{state.networkConditions.jitter.toFixed(1)}ms</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Bitrate:</span>
+                <span className="ml-2">{formatBitrate(state.bitrate)}</span>
               </div>
             </div>
           )}
@@ -168,7 +206,8 @@ export function UdpVoiceControls({
               onClick={() => controls.mute(true)}
               disabled={!state.isConnected || state.isMuted}
               variant={state.isMuted ? 'default' : 'outline'}
-              className="flex-1"
+              className={`flex-1 transition-all ${state.isMuted ? 'animate-pulse bg-voice-muted/80' : ''}`}
+              aria-label="Mute"
             >
               <MicOff className="h-4 w-4 mr-2" />
               Mute
@@ -202,7 +241,7 @@ export function UdpVoiceControls({
             </div>
             <Slider
               value={[volume]}
-              onValueChange={([value]) => setVolume(value)}
+              onValueChange={([value]) => handleSetVolume(value)}
               max={1}
               min={0}
               step={0.01}
@@ -217,6 +256,45 @@ export function UdpVoiceControls({
             </div>
           </div>
 
+          {/* VAD Controls */}
+          <div className="space-y-3">
+            <div className="flex items-center space-x-2">
+              <Checkbox
+                id="vad-enabled"
+                checked={state.vadEnabled}
+                onCheckedChange={(checked) => controls.setVADEnabled(checked as boolean)}
+                disabled={!state.isConnected}
+              />
+              <label htmlFor="vad-enabled" className="text-sm font-medium">
+                Voice Activity Detection (VAD)
+              </label>
+            </div>
+            
+            {state.vadEnabled && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-sm">
+                  <span>VAD Threshold</span>
+                  <span className="text-muted-foreground">
+                    {Math.round(state.vadThreshold * 100)}%
+                  </span>
+                </div>
+                <Slider
+                  value={[state.vadThreshold]}
+                  onValueChange={([value]) => controls.setVADThreshold(value)}
+                  max={1}
+                  min={0}
+                  step={0.01}
+                  className="w-full"
+                />
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <span>0%</span>
+                  <div className="flex-1" />
+                  <span>100%</span>
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Status Indicators */}
           <div className="flex gap-4 text-sm">
             <div className="flex items-center gap-2">
@@ -227,9 +305,50 @@ export function UdpVoiceControls({
               <div className={`w-2 h-2 rounded-full ${state.isReceiving ? 'bg-blue-500' : 'bg-gray-300'}`} />
               <span>Receiving</span>
             </div>
+            <div className="flex items-center gap-2">
+              <Activity className={`h-3 w-3 ${state.vadEnabled ? 'text-green-500' : 'text-gray-400'}`} />
+              <span>VAD</span>
+            </div>
           </div>
         </CardContent>
       </Card>
+
+      {/* Remote User Audio Controls */}
+      {state.isConnected && Object.keys(state.remoteUsers).length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Remote User Audio Controls</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {remoteUserList.map(([uid, u]) => (
+              <div key={uid} className="flex items-center gap-4 py-2 border-b last:border-b-0">
+                <div className="flex items-center gap-2 min-w-[120px]">
+                  <div className={`w-2 h-2 rounded-full ${u.isSpeaking ? 'bg-green-500' : 'bg-gray-300'}`} />
+                  <span className="font-mono text-xs">{uid}</span>
+                </div>
+                <Button
+                  size="icon"
+                  variant={u.isMuted ? 'default' : 'outline'}
+                  onClick={() => controls.toggleRemoteMute(uid)}
+                  className="mr-2"
+                >
+                  {u.isMuted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+                </Button>
+                <Slider
+                  value={[u.volume]}
+                  onValueChange={([value]) => controls.setRemoteVolume(uid, value)}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  className="flex-1"
+                  disabled={u.isMuted}
+                />
+                <span className="text-xs w-10 text-right">{Math.round(u.volume * 100)}%</span>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Settings Panel */}
       {showSettings && (
@@ -280,6 +399,29 @@ export function UdpVoiceControls({
               </Select>
             </div>
 
+            {/* Manual Bitrate Control */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Manual Bitrate Control</label>
+              <div className="flex items-center gap-2">
+                <Slider
+                  value={[state.bitrate]}
+                  onValueChange={([value]) => controls.setBitrate(value)}
+                  max={128000}
+                  min={16000}
+                  step={1000}
+                  className="flex-1"
+                />
+                <span className="text-sm text-muted-foreground min-w-[60px]">
+                  {formatBitrate(state.bitrate)}
+                </span>
+              </div>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <span>16 kbps</span>
+                <div className="flex-1" />
+                <span>128 kbps</span>
+              </div>
+            </div>
+
             {/* Connection Info */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Connection Info</label>
@@ -289,6 +431,8 @@ export function UdpVoiceControls({
                 <div>User: {userId}</div>
                 <div>Codec: Opus</div>
                 <div>Sample Rate: 48kHz</div>
+                <div>VAD: {state.vadEnabled ? 'Enabled' : 'Disabled'}</div>
+                <div>Adaptive Bitrate: Enabled</div>
               </div>
             </div>
           </CardContent>
@@ -296,7 +440,7 @@ export function UdpVoiceControls({
       )}
     </div>
   );
-}
+});
 
 // Usage Example Component
 export function UdpVoiceExample() {
@@ -364,5 +508,28 @@ export function UdpVoiceExample() {
         />
       )}
     </div>
+  );
+}
+
+// Replace audio level bar with animated circular audio level ring
+function AudioLevelRing({ level }: { level: number }) {
+  return (
+    <svg width="48" height="48" viewBox="0 0 48 48" className="block mx-auto">
+      <circle cx="24" cy="24" r="20" fill="none" stroke="#e5e7eb" strokeWidth="4" />
+      <motion.circle
+        cx="24"
+        cy="24"
+        r="20"
+        fill="none"
+        stroke="#6366f1"
+        strokeWidth="4"
+        strokeDasharray={2 * Math.PI * 20}
+        strokeDashoffset={2 * Math.PI * 20 * (1 - level)}
+        initial={false}
+        animate={{ strokeDashoffset: 2 * Math.PI * 20 * (1 - level) }}
+        transition={{ type: 'spring', stiffness: 120, damping: 14 }}
+        style={{ filter: level > 0.1 ? 'drop-shadow(0 0 8px #6366f1cc)' : undefined }}
+      />
+    </svg>
   );
 } 

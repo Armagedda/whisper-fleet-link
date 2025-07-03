@@ -3,6 +3,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Lock, Globe, KeyRound, Crown, Shield, User } from "lucide-react";
+import { AnimatePresence, motion } from 'framer-motion';
 
 interface Channel {
   id: string;
@@ -66,6 +67,7 @@ const ChannelList: React.FC<ChannelListProps> = ({
 }) => {
   const [loadingChannelId, setLoadingChannelId] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [loading, setLoading] = React.useState(false);
 
   const handleJoin = async (channel: Channel) => {
     setError(null);
@@ -99,68 +101,97 @@ const ChannelList: React.FC<ChannelListProps> = ({
 
   return (
     <div className="grid gap-4" role="list" aria-label="Channel list">
-      {channels.map((channel) => {
-        const isJoined = joinedChannelId === channel.id;
-        const isLoading = loadingChannelId === channel.id;
-        return (
-          <Card
-            key={channel.id}
-            className={`transition-shadow focus-within:ring-2 focus-within:ring-primary/60 ${
-              isJoined ? "border-primary ring-2 ring-primary/40" : ""
-            }`}
-            tabIndex={0}
-            aria-current={isJoined}
-            role="listitem"
-          >
-            <CardContent className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 py-4">
-              <div className="flex items-center gap-3 min-w-0">
-                {privacyInfo[channel.privacy].icon}
-                <span className="font-semibold truncate" title={channel.name}>
-                  {channel.name}
-                </span>
-                {privacyInfo[channel.privacy].badge}
-                {channel.userRole && (
-                  <span className="ml-2 flex items-center">
-                    {roleInfo[channel.userRole].icon}
-                    {roleInfo[channel.userRole].badge}
-                  </span>
-                )}
-              </div>
-              <div className="flex gap-2 mt-2 sm:mt-0">
-                {isJoined ? (
-                  <Button
-                    variant="outline"
-                    onClick={() => handleLeave(channel)}
-                    disabled={isLoading}
-                    aria-label={`Leave channel ${channel.name}`}
-                  >
-                    {isLoading ? (
-                      <span className="flex items-center"><span className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />Leaving...</span>
-                    ) : (
-                      "Leave"
+      <AnimatePresence>
+        {loading ? (
+          <motion.div
+            key="shimmer"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="rounded-xl shadow-md bg-gradient-to-br from-zinc-800/60 to-zinc-900/80 backdrop-blur-lg border border-border h-20 w-full animate-pulse"
+          />
+        ) : (
+          channels.map((channel) => {
+            const isJoined = joinedChannelId === channel.id;
+            const isLoading = loadingChannelId === channel.id;
+            return (
+              <motion.div
+                key={channel.id}
+                initial={{ opacity: 0, y: 16 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 16 }}
+                whileHover={{ scale: 1.02, boxShadow: '0 0 0 2px #a5b4fc, 0 4px 24px 0 #0002' }}
+                whileFocus={{ scale: 1.01, boxShadow: '0 0 0 2px #818cf8, 0 4px 24px 0 #0002' }}
+                transition={{ type: 'spring', duration: 0.3 }}
+                className={`transition-shadow focus-within:ring-2 focus-within:ring-primary/60 rounded-xl shadow-md bg-gradient-to-br from-zinc-800/60 to-zinc-900/80 backdrop-blur-lg border border-border ${isJoined ? "border-primary ring-2 ring-primary/40" : ""}`}
+                tabIndex={0}
+                aria-current={isJoined}
+                role="listitem"
+              >
+                <CardContent className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 py-4 px-4">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span className="w-8 h-8 rounded-full flex items-center justify-center font-bold text-white bg-gradient-to-br from-primary to-secondary shadow-inner mr-2">
+                      {channel.name.charAt(0).toUpperCase()}
+                    </span>
+                    {privacyInfo[channel.privacy].icon}
+                    <span className="font-semibold truncate text-base" title={channel.name}>
+                      {channel.name}
+                    </span>
+                    <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium bg-primary/10 text-primary border border-primary/20 ml-2">
+                      {privacyInfo[channel.privacy].icon}
+                      {privacyInfo[channel.privacy].label}
+                    </span>
+                    {channel.userRole && (
+                      <span className="ml-2 flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium bg-secondary/10 text-secondary border border-secondary/20">
+                        {roleInfo[channel.userRole].icon}
+                        {roleInfo[channel.userRole].label}
+                      </span>
                     )}
-                  </Button>
-                ) : (
-                  <Button
-                    onClick={() => handleJoin(channel)}
-                    disabled={isLoading}
-                    aria-label={`Join channel ${channel.name}`}
-                  >
-                    {isLoading ? (
-                      <span className="flex items-center"><span className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />Joining...</span>
+                    <span className="ml-2 flex items-center gap-1">
+                      {[...Array(Math.min(8, Math.floor(Math.random() * 8) + 1))].map((_, i) => (
+                        <span key={i} className="w-1.5 h-1.5 rounded-full bg-primary/60 inline-block" />
+                      ))}
+                    </span>
+                  </div>
+                  <div className="flex gap-2 mt-2 sm:mt-0">
+                    {isJoined ? (
+                      <Button
+                        variant="outline"
+                        onClick={() => handleLeave(channel)}
+                        disabled={isLoading}
+                        aria-label={`Leave channel ${channel.name}`}
+                        className="rounded-lg px-4 py-2 focus:ring-2 focus:ring-primary/50"
+                      >
+                        {isLoading ? (
+                          <span className="flex items-center"><span className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />Leaving...</span>
+                        ) : (
+                          "Leave"
+                        )}
+                      </Button>
                     ) : (
-                      channel.privacy === "invite_only" ? "Request Invite" : "Join"
+                      <Button
+                        onClick={() => handleJoin(channel)}
+                        disabled={isLoading}
+                        aria-label={`Join channel ${channel.name}`}
+                        className="rounded-lg px-4 py-2 focus:ring-2 focus:ring-primary/50"
+                      >
+                        {isLoading ? (
+                          <span className="flex items-center"><span className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />Joining...</span>
+                        ) : (
+                          channel.privacy === "invite_only" ? "Request Invite" : "Join"
+                        )}
+                      </Button>
                     )}
-                  </Button>
+                  </div>
+                </CardContent>
+                {isJoined && error && (
+                  <div className="px-4 pb-2 text-destructive text-sm font-medium bg-destructive/10 rounded-b-lg" role="alert">{error}</div>
                 )}
-              </div>
-            </CardContent>
-            {isJoined && error && (
-              <div className="px-4 pb-2 text-destructive text-sm" role="alert">{error}</div>
-            )}
-          </Card>
-        );
-      })}
+              </motion.div>
+            );
+          })
+        )}
+      </AnimatePresence>
     </div>
   );
 };

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useReducer, Dispatch } from 'react';
 
 /*
 Usage Example:
@@ -119,6 +119,46 @@ export interface UseVoiceWebSocketReturn {
   sendMessage: (message: WsMessage) => void;
   isConnected: boolean;
   error: string | null;
+}
+
+type UserStateType = {
+  user_id: string;
+  username: string;
+  is_muted: boolean;
+  is_speaking: boolean;
+};
+
+type UserAction =
+  | { type: 'update'; user: UserStateType }
+  | { type: 'remove'; user_id: string }
+  | { type: 'set'; users: UserStateType[] };
+
+function userReducer(state: UserStateType[], action: UserAction): UserStateType[] {
+  switch (action.type) {
+    case 'update':
+      const idx = state.findIndex(u => u.user_id === action.user.user_id);
+      if (idx !== -1) {
+        const updated = [...state];
+        updated[idx] = { ...updated[idx], ...action.user };
+        return updated;
+      } else {
+        return [...state, action.user];
+      }
+    case 'remove':
+      return state.filter(u => u.user_id !== action.user_id);
+    case 'set':
+      return action.users;
+    default:
+      return state;
+  }
+}
+
+function useDebouncedDispatch(dispatch: Dispatch<UserAction>, delay = 30) {
+  const timeout = useRef<number | null>(null);
+  return useCallback((action: UserAction) => {
+    if (timeout.current) window.clearTimeout(timeout.current);
+    timeout.current = window.setTimeout(() => dispatch(action), delay);
+  }, [dispatch, delay]);
 }
 
 const useVoiceWebSocket = ({

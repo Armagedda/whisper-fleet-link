@@ -4,6 +4,9 @@ use axum::{
 };
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use std::fs;
+use std::path::PathBuf;
+use tracing_appender::rolling;
 
 mod routes;
 mod ws;
@@ -11,16 +14,30 @@ mod audio;
 use routes::channels::AppState;
 use ws::WsAppState;
 use audio::AudioServer;
+mod setup;
+mod notify_helper;
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
+    // Set up file logging to %APPDATA%/WhisperFleetLink/log.txt
+    let log_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    let log_dir = log_dir.join("WhisperFleetLink");
+    fs::create_dir_all(&log_dir).ok();
+    let file_appender = rolling::never(&log_dir, "log.txt");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
         ))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
         .init();
+
+    // Orchestrate all setup, cert, and update logic
+    if let Err(e) = run_startup().await {
+        tracing::error!("Critical startup error: {}", e);
+        notify_helper::notify_user("Whisper Fleet Link Error", &format!("Critical startup error: {}", e));
+        std::process::exit(1);
+    }
 
     // Configure CORS
     let cors = CorsLayer::new()
@@ -47,7 +64,12 @@ async fn main() {
 
     // Create auth router
     let auth_router = Router::new()
-        .route("/login", post(routes::auth::login));
+        .route("/login", post(routes::auth::login))
+        .route("/google", get(routes::auth::google_oauth))
+        .route("/github", get(routes::auth::github_oauth))
+        .route("/reset", post(routes::auth::reset_password))
+        .route("/reset/confirm", post(routes::auth::confirm_reset))
+        .route("/2fa/verify", post(routes::auth::verify_2fa));
 
     // Create channels router with new role management endpoints
     let channels_router = Router::new()
@@ -96,4 +118,16 @@ async fn main() {
             tracing::info!("Audio server stopped");
         }
     }
+}
+
+async fn run_startup() -> Result<(), String> {
+    // 1. Setup (keys, config, certs)
+    setup::run_first_time_setup().await;
+    // 2. Auto-update (non-blocking)
+    tokio::spawn(async {
+        if let Err(e) = crate::auto_update::check_and_apply_update(env!("CARGO_PKG_VERSION")).await {
+            tracing::warn!("Auto-update failed: {}", e);
+        }
+    });
+    Ok(())
 } 

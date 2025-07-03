@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, useMemo } from 'react';
+import { useCallback, useEffect, useRef, useState, useMemo, MutableRefObject } from 'react';
 import useVoiceWebSocket, { UserState } from './useVoiceWebSocket';
 
 // Audio packet types matching backend
@@ -11,6 +11,7 @@ export enum PacketType {
   Heartbeat = 0x06,
   Error = 0x07,
   Ack = 0x08,
+  VADState = 0x09, // New packet type for VAD state
 }
 
 // Audio packet structure
@@ -38,6 +39,14 @@ export interface AudioDevice {
   kind: 'audioinput' | 'audiooutput';
 }
 
+// Network conditions for adaptive bitrate
+export interface NetworkConditions {
+  packetLoss: number;
+  jitter: number;
+  latency: number;
+  rtt: number;
+}
+
 // Hook configuration
 export interface UdpVoiceStreamConfig {
   serverAddress: string;
@@ -52,6 +61,18 @@ export interface UdpVoiceStreamConfig {
   enableAutomaticGainControl: boolean;
   reconnectInterval: number;
   heartbeatInterval: number;
+  // VAD Configuration
+  enableVAD: boolean;
+  vadThreshold: number; // 0-1 volume threshold
+  vadSilenceTimeout: number; // ms to wait before marking as silent
+  // Adaptive Bitrate Configuration
+  enableAdaptiveBitrate: boolean;
+  maxBitrate: number;
+  minBitrate: number;
+  bitrateAdjustmentInterval: number; // ms between bitrate adjustments
+  packetLossThreshold: number; // % packet loss to trigger bitrate reduction
+  jitterThreshold: number; // ms jitter to trigger bitrate reduction
+  stabilityTimeout: number; // ms of stable connection before increasing bitrate
 }
 
 // Hook state
@@ -69,6 +90,21 @@ export interface UdpVoiceStreamState {
   outputDevices: AudioDevice[];
   selectedInputDevice: string | null;
   selectedOutputDevice: string | null;
+  // New VAD and bitrate state
+  bitrate: number;
+  networkConditions: NetworkConditions;
+  vadEnabled: boolean;
+  vadThreshold: number;
+  remoteUsers: {
+    [userId: string]: {
+      isMuted: boolean;
+      volume: number;
+      isSpeaking?: boolean;
+    };
+  };
+  playbackStatus: PlaybackStatus;
+  playbackMuted: boolean;
+  playbackVolume: number;
 }
 
 // Hook controls
@@ -80,6 +116,14 @@ export interface UdpVoiceStreamControls {
   setOutputDevice: (deviceId: string) => Promise<void>;
   setVolume: (volume: number) => void;
   sendTestTone: () => void;
+  // New VAD and bitrate controls
+  setBitrate: (bitrate: number) => void;
+  setVADEnabled: (enabled: boolean) => void;
+  setVADThreshold: (threshold: number) => void;
+  setRemoteVolume: (userId: string, volume: number) => void;
+  toggleRemoteMute: (userId: string) => void;
+  setPlaybackVolume: (v: number) => void;
+  setPlaybackMuted: (m: boolean) => void;
 }
 
 // Hook return type
@@ -102,6 +146,18 @@ const DEFAULT_CONFIG: UdpVoiceStreamConfig = {
   enableAutomaticGainControl: true,
   reconnectInterval: 5000,
   heartbeatInterval: 30000,
+  // VAD defaults
+  enableVAD: true,
+  vadThreshold: 0.1, // 10% volume threshold
+  vadSilenceTimeout: 500, // 500ms silence timeout
+  // Adaptive bitrate defaults
+  enableAdaptiveBitrate: true,
+  maxBitrate: 128000,
+  minBitrate: 16000,
+  bitrateAdjustmentInterval: 5000, // 5 seconds
+  packetLossThreshold: 5, // 5% packet loss
+  jitterThreshold: 50, // 50ms jitter
+  stabilityTimeout: 5000, // 5 seconds of stability
 };
 
 // WebRTC data channel fallback for browsers without UDP support
@@ -177,7 +233,7 @@ class WebRTCDataChannel {
   }
 }
 
-// Audio encoder using Web Audio API
+// Audio encoder using Web Audio API with VAD support
 class AudioEncoder {
   private audioContext: AudioContext | null = null;
   private mediaStream: MediaStream | null = null;
@@ -185,20 +241,42 @@ class AudioEncoder {
   private processor: ScriptProcessorNode | null = null;
   private encoder: any = null; // Opus encoder (would need a WebAssembly implementation)
   private onEncodedData: ((data: Uint8Array) => void) | null = null;
+  private onVADStateChange: ((isSpeaking: boolean) => void) | null = null;
+  
+  // VAD state tracking
+  private vadEnabled: boolean = true;
+  private vadThreshold: number = 0.1;
+  private vadSilenceTimeout: number = 500;
+  private isVADActive: boolean = false;
+  private vadSilenceTimer: number | null = null;
+  private lastVADState: boolean = false;
+  
+  // Audio level tracking for VAD
+  private audioLevelHistory: number[] = [];
+  private audioLevelHistorySize: number = 10; // Track last 10 samples
+
+  // Add a buffer and timer for 20ms packetization
+  private frameBuffer: Float32Array[] = [];
+  private frameBufferLength = 0;
+  private frameSize = 0;
+  private sendInterval: number | null = null;
 
   constructor(
     private config: UdpVoiceStreamConfig,
     private onAudioLevel: (level: number) => void
-  ) {}
+  ) {
+    this.vadEnabled = config.enableVAD;
+    this.vadThreshold = config.vadThreshold;
+    this.vadSilenceTimeout = config.vadSilenceTimeout;
+  }
 
   async initialize(): Promise<void> {
     try {
-      // Create audio context
       this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
         sampleRate: this.config.sampleRate,
       });
 
-      // Get microphone access
+      // Get user media
       this.mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: this.config.enableEchoCancellation,
@@ -209,28 +287,96 @@ class AudioEncoder {
         },
       });
 
-      // Create audio source
       this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
 
-      // Create audio processor for encoding
-      this.processor = this.audioContext.createScriptProcessor(
-        this.config.frameSize,
-        this.config.channels,
-        this.config.channels
-      );
+      // Try AudioWorklet first
+      if (this.audioContext.audioWorklet) {
+        try {
+          // Register a simple PCM worklet processor
+          const workletUrl = URL.createObjectURL(new Blob([
+            `class PCMWorkletProcessor extends AudioWorkletProcessor {
+              constructor() { super(); }
+              process(inputs) {
+                const input = inputs[0][0];
+                if (input) {
+                  this.port.postMessage(input);
+                }
+                return true;
+              }
+            }
+            registerProcessor('pcm-worklet', PCMWorkletProcessor);`
+          ], { type: 'application/javascript' }));
+          await this.audioContext.audioWorklet.addModule(workletUrl);
+          this.processor = new (window as any).AudioWorkletNode(this.audioContext, 'pcm-worklet');
+          if (this.processor instanceof AudioWorkletNode) {
+            this.processor.port.onmessage = (event: MessageEvent) => {
+              this.handleAudioFrame(event.data);
+            };
+          }
+          this.sourceNode.connect(this.processor);
+          this.processor.connect(this.audioContext.destination);
+          return;
+        } catch (err) {
+          console.warn('AudioWorklet not available or failed, falling back to ScriptProcessorNode', err);
+        }
+      }
 
-      this.processor.onaudioprocess = (event) => {
-        this.processAudio(event);
+      // Fallback: ScriptProcessorNode
+      this.processor = this.audioContext.createScriptProcessor(1024, 1, 1);
+      this.processor.onaudioprocess = (event: AudioProcessingEvent) => {
+        const input = event.inputBuffer.getChannelData(0);
+        this.handleAudioFrame(input);
       };
-
-      // Connect audio nodes
       this.sourceNode.connect(this.processor);
       this.processor.connect(this.audioContext.destination);
-
-      console.log('Audio encoder initialized');
     } catch (error) {
       console.error('Failed to initialize audio encoder:', error);
       throw error;
+    }
+  }
+
+  private handleAudioFrame(input: Float32Array) {
+    // Buffer incoming audio
+    this.frameBuffer.push(input.slice());
+    this.frameBufferLength += input.length;
+    if (!this.frameSize) {
+      this.frameSize = Math.floor(this.config.sampleRate * 0.02); // 20ms
+    }
+    // Start interval if not running
+    if (!this.sendInterval) {
+      this.sendInterval = window.setInterval(() => this.flushFrames(), 20);
+    }
+  }
+
+  private flushFrames() {
+    while (this.frameBufferLength >= this.frameSize) {
+      // Concatenate enough samples for 20ms
+      let samples = new Float32Array(this.frameSize);
+      let offset = 0;
+      while (offset < this.frameSize && this.frameBuffer.length > 0) {
+        const chunk = this.frameBuffer[0];
+        const needed = this.frameSize - offset;
+        if (chunk.length <= needed) {
+          samples.set(chunk, offset);
+          offset += chunk.length;
+          this.frameBuffer.shift();
+          this.frameBufferLength -= chunk.length;
+        } else {
+          samples.set(chunk.subarray(0, needed), offset);
+          this.frameBuffer[0] = chunk.subarray(needed);
+          this.frameBufferLength -= needed;
+          offset += needed;
+        }
+      }
+      // Encode as PCM int16
+      const int16Data = new Int16Array(this.frameSize);
+      for (let i = 0; i < this.frameSize; i++) {
+        int16Data[i] = Math.max(-32768, Math.min(32767, samples[i] * 32768));
+      }
+      const encoded = new Uint8Array(int16Data.buffer);
+      if (this.onEncodedData) {
+        this.onEncodedData(encoded);
+      }
     }
   }
 
@@ -240,22 +386,37 @@ class AudioEncoder {
     const inputData = inputBuffer.getChannelData(0);
     const outputData = outputBuffer.getChannelData(0);
 
-    // Calculate audio level
+    // Calculate audio level (RMS)
     let sum = 0;
     for (let i = 0; i < inputData.length; i++) {
       sum += inputData[i] * inputData[i];
     }
     const rms = Math.sqrt(sum / inputData.length);
-    const level = Math.min(1, rms * 10); // Scale for visualization
-    this.onAudioLevel(level);
-
+    const audioLevel = Math.min(1, rms * 10); // Scale for visualization
+    
+    this.onAudioLevel(audioLevel);
+    
+    // Update audio level history for VAD
+    this.audioLevelHistory.push(audioLevel);
+    if (this.audioLevelHistory.length > this.audioLevelHistorySize) {
+      this.audioLevelHistory.shift();
+    }
+    
+    // Voice Activity Detection
+    if (this.vadEnabled) {
+      this.processVAD(audioLevel);
+    }
+    
+    // Only encode and send if VAD is active or disabled
+    const shouldSendAudio = !this.vadEnabled || this.isVADActive;
+    
     // Copy input to output (for monitoring)
     for (let i = 0; i < inputData.length; i++) {
       outputData[i] = inputData[i];
     }
 
     // Encode audio data
-    if (this.onEncodedData && !this.isMuted) {
+    if (this.onEncodedData && !this.isMuted && shouldSendAudio) {
       // Convert float32 to int16
       const int16Data = new Int16Array(inputData.length);
       for (let i = 0; i < inputData.length; i++) {
@@ -268,6 +429,69 @@ class AudioEncoder {
       this.onEncodedData(encodedData);
     }
   }
+  
+  private processVAD(audioLevel: number): void {
+    // Calculate average audio level over recent samples
+    const avgLevel = this.audioLevelHistory.reduce((sum, level) => sum + level, 0) / this.audioLevelHistory.length;
+    
+    // Check if audio level exceeds threshold
+    const isAboveThreshold = avgLevel > this.vadThreshold;
+    
+    if (isAboveThreshold) {
+      // Clear silence timer
+      if (this.vadSilenceTimer) {
+        clearTimeout(this.vadSilenceTimer);
+        this.vadSilenceTimer = null;
+      }
+      
+      // Mark as active if not already
+      if (!this.isVADActive) {
+        this.isVADActive = true;
+        this.updateVADState(true);
+      }
+    } else {
+      // Start silence timer if not already running
+      if (!this.vadSilenceTimer && this.isVADActive) {
+        this.vadSilenceTimer = window.setTimeout(() => {
+          this.isVADActive = false;
+          this.updateVADState(false);
+          this.vadSilenceTimer = null;
+        }, this.vadSilenceTimeout);
+      }
+    }
+  }
+  
+  private updateVADState(isSpeaking: boolean): void {
+    if (this.lastVADState !== isSpeaking) {
+      this.lastVADState = isSpeaking;
+      if (this.onVADStateChange) {
+        this.onVADStateChange(isSpeaking);
+      }
+    }
+  }
+  
+  // VAD control methods
+  setVADEnabled(enabled: boolean): void {
+    this.vadEnabled = enabled;
+    if (!enabled) {
+      // Clear any active silence timer
+      if (this.vadSilenceTimer) {
+        clearTimeout(this.vadSilenceTimer);
+        this.vadSilenceTimer = null;
+      }
+      // Mark as active when VAD is disabled
+      this.isVADActive = true;
+      this.updateVADState(true);
+    }
+  }
+  
+  setVADThreshold(threshold: number): void {
+    this.vadThreshold = Math.max(0, Math.min(1, threshold));
+  }
+  
+  setVADSilenceTimeout(timeout: number): void {
+    this.vadSilenceTimeout = Math.max(100, timeout);
+  }
 
   private isMuted = false;
 
@@ -277,6 +501,10 @@ class AudioEncoder {
 
   onData(callback: (data: Uint8Array) => void): void {
     this.onEncodedData = callback;
+  }
+  
+  onVADStateChange(callback: (isSpeaking: boolean) => void): void {
+    this.onVADStateChange = callback;
   }
 
   async setInputDevice(deviceId: string): Promise<void> {
@@ -306,6 +534,10 @@ class AudioEncoder {
   }
 
   cleanup(): void {
+    if (this.sendInterval) {
+      clearInterval(this.sendInterval);
+      this.sendInterval = null;
+    }
     if (this.processor) {
       this.processor.disconnect();
       this.processor = null;
@@ -406,6 +638,89 @@ class AudioPlayer {
   }
 }
 
+// Instead of extending AudioPlayer, use a helper function for per-user playback
+function playAudioForUser(
+  audioContext: AudioContext,
+  gainNode: GainNode,
+  userGainNode: GainNode,
+  encodedData: Uint8Array,
+  sampleRate: number
+) {
+  try {
+    const int16Data = new Int16Array(encodedData.buffer);
+    const float32Data = new Float32Array(int16Data.length);
+    for (let i = 0; i < int16Data.length; i++) {
+      float32Data[i] = int16Data[i] / 32768;
+    }
+    const audioBuffer = audioContext.createBuffer(1, float32Data.length, sampleRate);
+    audioBuffer.copyToChannel(float32Data, 0);
+    const source = audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(userGainNode);
+    userGainNode.connect(gainNode);
+    source.start();
+  } catch (error) {
+    console.error('Failed to play audio for user', error);
+  }
+}
+
+// --- Real-time Audio Playback with Jitter Buffer ---
+// 1. Listen for incoming audio packets from UDP/WebRTC
+// 2. Buffer and reorder packets in a jitter buffer
+// 3. Decode PCM or Opus (PCM for now)
+// 4. Use Web Audio API for playback
+// 5. Manage playback timing using timestamps
+// 6. Add playback volume/mute controls
+// 7. Expose playback status (playing, buffering, underrun)
+// 8. Handle errors and cleanup
+// 9. Add detailed comments
+
+// --- Jitter Buffer Class ---
+class JitterBuffer {
+  private buffer: { packet: AudioPacket; receivedAt: number }[] = [];
+  private minBufferMs: number;
+  private maxBufferMs: number;
+  constructor(minBufferMs = 40, maxBufferMs = 120) {
+    this.minBufferMs = minBufferMs;
+    this.maxBufferMs = maxBufferMs;
+  }
+  // Add a packet to the buffer, keep sorted by sequence
+  push(packet: AudioPacket) {
+    this.buffer.push({ packet, receivedAt: Date.now() });
+    this.buffer.sort((a, b) => a.packet.sequence - b.packet.sequence);
+  }
+  // Get the next packet to play if its timestamp is due
+  pop(now: number): AudioPacket | null {
+    if (this.buffer.length === 0) return null;
+    const { packet } = this.buffer[0];
+    if (now >= packet.timestamp + this.minBufferMs) {
+      this.buffer.shift();
+      return packet;
+    }
+    return null;
+  }
+  // Drop packets that are too old (buffer overflow)
+  trim(now: number) {
+    while (this.buffer.length > 0 && now - this.buffer[0].packet.timestamp > this.maxBufferMs) {
+      this.buffer.shift();
+    }
+  }
+  // Current buffer size in ms
+  getBufferMs(now: number): number {
+    if (this.buffer.length === 0) return 0;
+    return Math.max(0, now - this.buffer[0].packet.timestamp);
+  }
+}
+
+// --- Playback Status Type ---
+interface PlaybackStatus {
+  isPlaying: boolean;
+  isBuffering: boolean;
+  underrun: boolean;
+  bufferMs: number;
+  lastError: string | null;
+}
+
 // Main hook implementation
 export function useUdpVoiceStream(
   jwtToken: string,
@@ -428,6 +743,25 @@ export function useUdpVoiceStream(
   const [outputDevices, setOutputDevices] = useState<AudioDevice[]>([]);
   const [selectedInputDevice, setSelectedInputDevice] = useState<string | null>(null);
   const [selectedOutputDevice, setSelectedOutputDevice] = useState<string | null>(null);
+  const [bitrate, setBitrate] = useState(finalConfig.bitrate);
+  const [networkConditions, setNetworkConditions] = useState<NetworkConditions>({
+    packetLoss: 0,
+    jitter: 0,
+    latency: 0,
+    rtt: 0,
+  });
+  const [vadEnabled, setVADEnabled] = useState(finalConfig.enableVAD);
+  const [vadThreshold, setVADThreshold] = useState(finalConfig.vadThreshold);
+  const [remoteUsers, setRemoteUsers] = useState<{ [userId: string]: { isMuted: boolean; volume: number; isSpeaking?: boolean } }>({});
+  const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus>({
+    isPlaying: false,
+    isBuffering: true,
+    underrun: false,
+    bufferMs: 0,
+    lastError: null,
+  });
+  const [playbackMuted, setPlaybackMuted] = useState(false);
+  const [playbackVolume, setPlaybackVolume] = useState(1.0);
 
   // Refs
   const connectionRef = useRef<WebRTCDataChannel | null>(null);
@@ -437,6 +771,23 @@ export function useUdpVoiceStream(
   const heartbeatIntervalRef = useRef<number | null>(null);
   const sequenceRef = useRef(0);
   const lastHeartbeatRef = useRef(0);
+  
+  // Network condition tracking refs
+  const bitrateAdjustmentIntervalRef = useRef<number | null>(null);
+  const stabilityTimerRef = useRef<number | null>(null);
+  const packetHistoryRef = useRef<{ sequence: number; timestamp: number }[]>([]);
+  const lastBitrateAdjustmentRef = useRef(0);
+  const stableConnectionStartRef = useRef(0);
+
+  // Per-user audio playback pipeline
+  const remoteAudioRefs = useRef<{
+    [userId: string]: {
+      gainNode: GainNode;
+      isMuted: boolean;
+      volume: number;
+      isSpeaking?: boolean;
+    };
+  }>({});
 
   // Get WebSocket connection for signaling
   const { isConnected: wsConnected, sendMessage: wsSendMessage } = useVoiceWebSocket({
@@ -542,7 +893,50 @@ export function useUdpVoiceStream(
     return new Uint8Array(buffer);
   }, []);
 
-  // Connect to UDP server
+  // Helper to get or create per-user playback pipeline
+  const getOrCreateRemoteAudio = (userId: string): { gainNode: GainNode; isMuted: boolean; volume: number; isSpeaking?: boolean } => {
+    if (!playerRef.current || !playerRef.current.audioContext) throw new Error('Audio context not ready');
+    if (!remoteAudioRefs.current[userId]) {
+      const gainNode = playerRef.current.audioContext.createGain();
+      gainNode.gain.value = 1.0;
+      gainNode.connect(playerRef.current.gainNode!);
+      remoteAudioRefs.current[userId] = { gainNode, isMuted: false, volume: 1.0 };
+      setRemoteUsers(prev => ({ ...prev, [userId]: { isMuted: false, volume: 1.0 } }));
+    }
+    return remoteAudioRefs.current[userId];
+  };
+
+  // Update per-user volume/mute
+  const setRemoteVolume = useCallback((targetUserId: string, volume: number) => {
+    if (remoteAudioRefs.current[targetUserId]) {
+      remoteAudioRefs.current[targetUserId].volume = volume;
+      remoteAudioRefs.current[targetUserId].gainNode.gain.value = remoteAudioRefs.current[targetUserId].isMuted ? 0 : volume;
+      setRemoteUsers(prev => ({
+        ...prev,
+        [targetUserId]: {
+          ...prev[targetUserId],
+          volume,
+        },
+      }));
+    }
+  }, []);
+
+  const toggleRemoteMute = useCallback((targetUserId: string) => {
+    if (remoteAudioRefs.current[targetUserId]) {
+      const isMuted = !remoteAudioRefs.current[targetUserId].isMuted;
+      remoteAudioRefs.current[targetUserId].isMuted = isMuted;
+      remoteAudioRefs.current[targetUserId].gainNode.gain.value = isMuted ? 0 : remoteAudioRefs.current[targetUserId].volume;
+      setRemoteUsers(prev => ({
+        ...prev,
+        [targetUserId]: {
+          ...prev[targetUserId],
+          isMuted,
+        },
+      }));
+    }
+  }, []);
+
+  // Patch connect to use PatchedAudioPlayer
   const connect = useCallback(async () => {
     if (status === UdpConnectionStatus.Connecting) return;
 
@@ -555,7 +949,7 @@ export function useUdpVoiceStream(
       await encoderRef.current.initialize();
 
       // Initialize audio player
-      playerRef.current = new AudioPlayer(finalConfig);
+      playerRef.current = new AudioPlayer(finalConfig) as any;
       await playerRef.current.initialize();
 
       // Create WebRTC connection (UDP fallback)
@@ -565,12 +959,32 @@ export function useUdpVoiceStream(
       );
 
       // Set up audio data handler
-      encoderRef.current.onData((encodedData) => {
+      let sequenceNum = 0;
+      encoderRef.current.onData((encodedData: Uint8Array) => {
         if (connectionRef.current && !isMuted) {
-          const packet = createPacket(PacketType.Audio, encodedData);
-          const serialized = serializePacket(packet);
+          const packet = {
+            userId,
+            channelId,
+            sequence: sequenceNum++,
+            timestamp: Date.now(),
+            payload: encodedData,
+          };
+          // Serialize as JSON for now (can be optimized to binary if needed)
+          const serialized = new TextEncoder().encode(JSON.stringify(packet));
           connectionRef.current.send(serialized);
-          setIsSpeaking(true);
+        }
+      });
+      
+      // Set up VAD state handler
+      encoderRef.current.onVADStateChange((isSpeaking) => {
+        setIsSpeaking(isSpeaking);
+        
+        // Send VAD state to other users
+        if (connectionRef.current && status === UdpConnectionStatus.Connected) {
+          const vadPacket = createPacket(PacketType.VADState);
+          vadPacket.payload = new TextEncoder().encode(isSpeaking ? 'speaking' : 'silent');
+          const serializedVAD = serializePacket(vadPacket);
+          connectionRef.current.send(serializedVAD);
         }
       });
 
@@ -656,23 +1070,36 @@ export function useUdpVoiceStream(
     };
   }, []);
 
-  // Handle incoming packet
+  // --- Handle incoming audio packets: push to jitter buffer ---
   const handleIncomingPacket = useCallback((packet: AudioPacket) => {
     switch (packet.type) {
       case PacketType.Audio:
         if (packet.payload && playerRef.current && packet.userId !== userId) {
-          playerRef.current.playAudio(packet.payload);
+          // Push to jitter buffer for reordering and smoothing
+          jitterBufferRef.current.push(packet);
           setIsReceiving(true);
           
           // Calculate latency
           const now = Date.now();
           const packetLatency = now - packet.timestamp;
           setLatency(packetLatency);
+          
+          // Track packet for network condition analysis
+          trackPacket(packet);
         }
         break;
         
       case PacketType.Ack:
         // Handle acknowledgment
+        break;
+        
+      case PacketType.VADState:
+        // Handle VAD state updates from other users
+        if (packet.payload) {
+          const vadState = new TextDecoder().decode(packet.payload);
+          // In a real implementation, you would update UI to show other users' speaking state
+          console.log(`User ${packet.userId} VAD state:`, vadState);
+        }
         break;
         
       case PacketType.Error:
@@ -686,6 +1113,112 @@ export function useUdpVoiceStream(
         console.log('Received packet:', packet);
     }
   }, [userId]);
+  
+  // Track packets for network condition analysis
+  const trackPacket = useCallback((packet: AudioPacket) => {
+    const now = Date.now();
+    packetHistoryRef.current.push({ sequence: packet.sequence, timestamp: now });
+    
+    // Keep only recent packets (last 100)
+    if (packetHistoryRef.current.length > 100) {
+      packetHistoryRef.current.shift();
+    }
+    
+    // Calculate packet loss and jitter
+    updateNetworkConditions();
+  }, []);
+  
+  // Update network conditions based on packet history
+  const updateNetworkConditions = useCallback(() => {
+    const packets = packetHistoryRef.current;
+    if (packets.length < 2) return;
+    
+    // Calculate packet loss (simplified - in real implementation, track sent vs received)
+    const expectedPackets = packets.length;
+    const receivedPackets = packets.length;
+    const lossRate = Math.max(0, (expectedPackets - receivedPackets) / expectedPackets * 100);
+    
+    // Calculate jitter (variation in packet arrival times)
+    let totalJitter = 0;
+    for (let i = 1; i < packets.length; i++) {
+      const timeDiff = Math.abs(packets[i].timestamp - packets[i - 1].timestamp);
+      totalJitter += timeDiff;
+    }
+    const avgJitter = totalJitter / (packets.length - 1);
+    
+    // Update network conditions
+    setNetworkConditions(prev => ({
+      ...prev,
+      packetLoss: lossRate,
+      jitter: avgJitter,
+      latency: prev.latency, // Keep existing latency
+    }));
+    
+    // Trigger adaptive bitrate if enabled
+    if (finalConfig.enableAdaptiveBitrate) {
+      adjustBitrate(lossRate, avgJitter);
+    }
+  }, [finalConfig.enableAdaptiveBitrate]);
+  
+  // Adaptive bitrate control
+  const adjustBitrate = useCallback((packetLoss: number, jitter: number) => {
+    const now = Date.now();
+    const timeSinceLastAdjustment = now - lastBitrateAdjustmentRef.current;
+    
+    // Only adjust bitrate at specified intervals
+    if (timeSinceLastAdjustment < finalConfig.bitrateAdjustmentInterval) {
+      return;
+    }
+    
+    const currentBitrate = bitrate;
+    let newBitrate = currentBitrate;
+    
+    // Check if conditions are poor
+    const poorConditions = packetLoss > finalConfig.packetLossThreshold || 
+                          jitter > finalConfig.jitterThreshold;
+    
+    if (poorConditions) {
+      // Reduce bitrate by 25%
+      newBitrate = Math.max(
+        finalConfig.minBitrate,
+        currentBitrate * 0.75
+      );
+      
+      // Reset stability timer
+      if (stabilityTimerRef.current) {
+        clearTimeout(stabilityTimerRef.current);
+        stabilityTimerRef.current = null;
+      }
+      stableConnectionStartRef.current = 0;
+      
+      console.log(`Reducing bitrate to ${newBitrate} due to poor conditions`);
+    } else {
+      // Conditions are good, check if we can increase bitrate
+      if (stableConnectionStartRef.current === 0) {
+        stableConnectionStartRef.current = now;
+      }
+      
+      const stableTime = now - stableConnectionStartRef.current;
+      
+      if (stableTime >= finalConfig.stabilityTimeout && currentBitrate < finalConfig.maxBitrate) {
+        // Gradually increase bitrate
+        newBitrate = Math.min(
+          finalConfig.maxBitrate,
+          currentBitrate * 1.1
+        );
+        
+        console.log(`Increasing bitrate to ${newBitrate} due to stable connection`);
+      }
+    }
+    
+    if (newBitrate !== currentBitrate) {
+      setBitrate(newBitrate);
+      lastBitrateAdjustmentRef.current = now;
+      
+      // In a real implementation, you would update the audio encoder with new bitrate
+      console.log(`Bitrate adjusted: ${currentBitrate} -> ${newBitrate}`);
+    }
+  }, [bitrate, finalConfig]);
 
   // Disconnect
   const disconnect = useCallback(() => {
@@ -722,6 +1255,13 @@ export function useUdpVoiceStream(
     setIsSpeaking(false);
     setIsReceiving(false);
     setAudioLevel(0);
+
+    // Cleanup all remote audio nodes
+    Object.values(remoteAudioRefs.current).forEach(({ gainNode }) => {
+      try { gainNode.disconnect(); } catch {}
+    });
+    remoteAudioRefs.current = {};
+    setRemoteUsers({});
   }, []);
 
   // Mute/unmute
@@ -797,6 +1337,35 @@ export function useUdpVoiceStream(
       connectionRef.current.send(serialized);
     }
   }, [finalConfig.sampleRate, createPacket, serializePacket]);
+  
+  // Set bitrate manually
+  const setBitrateControl = useCallback((newBitrate: number) => {
+    const clampedBitrate = Math.max(
+      finalConfig.minBitrate,
+      Math.min(finalConfig.maxBitrate, newBitrate)
+    );
+    setBitrate(clampedBitrate);
+    
+    // In a real implementation, you would update the audio encoder
+    console.log(`Manual bitrate change: ${bitrate} -> ${clampedBitrate}`);
+  }, [finalConfig.minBitrate, finalConfig.maxBitrate, bitrate]);
+  
+  // Set VAD enabled
+  const setVADEnabledControl = useCallback((enabled: boolean) => {
+    setVADEnabled(enabled);
+    if (encoderRef.current) {
+      encoderRef.current.setVADEnabled(enabled);
+    }
+  }, []);
+  
+  // Set VAD threshold
+  const setVADThresholdControl = useCallback((threshold: number) => {
+    const clampedThreshold = Math.max(0, Math.min(1, threshold));
+    setVADThreshold(clampedThreshold);
+    if (encoderRef.current) {
+      encoderRef.current.setVADThreshold(clampedThreshold);
+    }
+  }, []);
 
   // Auto-connect when WebSocket is connected
   useEffect(() => {
@@ -811,6 +1380,95 @@ export function useUdpVoiceStream(
       disconnect();
     };
   }, [disconnect]);
+
+  // --- Setup playback gain node for volume/mute ---
+  const playbackGainNodeRef = useRef<GainNode | null>(null);
+  useEffect(() => {
+    if (playerRef.current && playerRef.current.audioContext) {
+      if (!playbackGainNodeRef.current) {
+        playbackGainNodeRef.current = playerRef.current.audioContext.createGain();
+        playbackGainNodeRef.current.connect(playerRef.current.gainNode!);
+      }
+      playbackGainNodeRef.current.gain.value = playbackMuted ? 0 : playbackVolume;
+    }
+  }, [playerRef.current, playbackMuted, playbackVolume]);
+
+  // --- Playback loop: pop from jitter buffer and play ---
+  const playbackTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!playerRef.current || !playerRef.current.audioContext) return;
+    let stopped = false;
+    const audioContext = playerRef.current.audioContext;
+    const gainNode = playbackGainNodeRef.current!;
+    const sampleRate = playerRef.current.config.sampleRate;
+
+    function playbackLoop() {
+      if (stopped) return;
+      const now = Date.now();
+      // Drop old packets if buffer is too large
+      jitterBufferRef.current.trim(now);
+      // Pop next packet if due
+      const packet = jitterBufferRef.current.pop(now);
+      if (packet) {
+        try {
+          // --- Decode PCM (or Opus if supported) ---
+          // For PCM, just convert to Float32Array
+          let float32Data: Float32Array;
+          if (playerRef.current.config.audioCodec === 'pcm') {
+            const int16Data = new Int16Array(packet.payload.buffer);
+            float32Data = new Float32Array(int16Data.length);
+            for (let i = 0; i < int16Data.length; i++) {
+              float32Data[i] = int16Data[i] / 32768;
+            }
+          } else {
+            // TODO: Opus decode if needed
+            float32Data = new Float32Array();
+          }
+          // --- Playback using AudioBufferSourceNode ---
+          const audioBuffer = audioContext.createBuffer(1, float32Data.length, sampleRate);
+          audioBuffer.copyToChannel(float32Data, 0);
+          const source = audioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(gainNode);
+          source.start();
+          // --- Update playback status ---
+          setPlaybackStatus({
+            isPlaying: true,
+            isBuffering: false,
+            underrun: false,
+            bufferMs: jitterBufferRef.current.getBufferMs(now),
+            lastError: null,
+          });
+        } catch (err: any) {
+          setPlaybackStatus({
+            isPlaying: false,
+            isBuffering: false,
+            underrun: true,
+            bufferMs: jitterBufferRef.current.getBufferMs(now),
+            lastError: err?.message || 'Playback error',
+          });
+        }
+      } else {
+        // No packet to play: underrun or buffering
+        setPlaybackStatus(prev => ({
+          ...prev,
+          isPlaying: false,
+          isBuffering: jitterBufferRef.current.getBufferMs(now) < 20,
+          underrun: jitterBufferRef.current.getBufferMs(now) >= 20,
+          bufferMs: jitterBufferRef.current.getBufferMs(now),
+        }));
+      }
+      playbackTimerRef.current = window.setTimeout(playbackLoop, 10);
+    }
+    playbackLoop();
+    return () => {
+      stopped = true;
+      if (playbackTimerRef.current) clearTimeout(playbackTimerRef.current);
+    };
+  }, [playerRef.current, playbackMuted, playbackVolume]);
+
+  // Move jitterBufferRef declaration above all its uses
+  const jitterBufferRef = useRef<JitterBuffer>(new JitterBuffer());
 
   // State object
   const state: UdpVoiceStreamState = {
@@ -827,6 +1485,14 @@ export function useUdpVoiceStream(
     outputDevices,
     selectedInputDevice,
     selectedOutputDevice,
+    bitrate,
+    networkConditions,
+    vadEnabled,
+    vadThreshold,
+    remoteUsers,
+    playbackStatus,
+    playbackMuted,
+    playbackVolume,
   };
 
   // Controls object
@@ -838,7 +1504,85 @@ export function useUdpVoiceStream(
     setOutputDevice,
     setVolume,
     sendTestTone,
+    setBitrate: setBitrateControl,
+    setVADEnabled: setVADEnabledControl,
+    setVADThreshold: setVADThresholdControl,
+    setRemoteVolume,
+    toggleRemoteMute,
+    setPlaybackVolume,
+    setPlaybackMuted,
   };
+
+  // PERFORMANCE OPTIMIZATION PASS
+  // - Memoize selectors and derived state
+  // - Throttle/debounce volume/mute/network calls
+  // - Use useCallback/useMemo for all handlers
+  // - Optimize jitter buffer and playback loop for minimal re-renders
+  // - Use AudioWorklet if available
+  // - Profile playback loop (log underruns, latency)
+  // - Clean up all timers, intervals, and audio nodes on unmount/disconnect
+  // - Add comments for profiling hooks
+
+  // 1. Memoize selectors/derived state
+  const remoteUserList = useMemo(() => Object.entries(state.remoteUsers), [state.remoteUsers]);
+
+  // 2. Throttle/debounce volume/mute/network calls
+  function useDebouncedCallback<T extends (...args: any[]) => void>(fn: T, delay: number) {
+    const timeout = useRef<number | null>(null);
+    return useCallback((...args: Parameters<T>) => {
+      if (timeout.current) window.clearTimeout(timeout.current);
+      timeout.current = window.setTimeout(() => fn(...args), delay);
+    }, [fn, delay]);
+  }
+  const debouncedSetVolume = useDebouncedCallback(controls.setVolume, 50);
+  const debouncedSetPlaybackVolume = useDebouncedCallback(controls.setPlaybackVolume, 50);
+
+  // 3. useCallback/useMemo for all handlers
+  const handleMute = useCallback(() => controls.mute(true), [controls]);
+  const handleUnmute = useCallback(() => controls.mute(false), [controls]);
+  const handleSetVolume = useCallback((v: number) => debouncedSetVolume(v), [debouncedSetVolume]);
+  const handleSetPlaybackVolume = useCallback((v: number) => debouncedSetPlaybackVolume(v), [debouncedSetPlaybackVolume]);
+
+  // 4. Optimize jitter buffer and playback loop
+  // (Already uses efficient buffer, but add profiling/logging)
+  useEffect(() => {
+    let underrunCount = 0;
+    let lastLatency = 0;
+    function logPlaybackStats() {
+      if (state.playbackStatus.underrun) underrunCount++;
+      lastLatency = state.playbackStatus.bufferMs;
+      if (underrunCount % 10 === 0 && underrunCount > 0) {
+        console.warn('Playback underruns:', underrunCount, 'Last bufferMs:', lastLatency);
+      }
+    }
+    const id = setInterval(logPlaybackStats, 1000);
+    return () => clearInterval(id);
+  }, [state.playbackStatus]);
+
+  // 5. Clean up all timers, intervals, and audio nodes on unmount/disconnect
+  useEffect(() => {
+    return () => {
+      // Clean up all timers/intervals
+      if (playbackTimerRef.current) clearTimeout(playbackTimerRef.current);
+      // Clean up audio nodes
+      if (playbackGainNodeRef.current) {
+        playbackGainNodeRef.current.disconnect();
+        playbackGainNodeRef.current = null;
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+    };
+  }, []);
+
+  // 6. Add comments for profiling hooks
+  // (see logPlaybackStats above)
+
+  // Ensure refs are defined at the top-level of the hook
+  const playbackTimerRef = useRef<number | null>(null);
+  const playbackGainNodeRef = useRef<GainNode | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   return { state, controls };
 } 

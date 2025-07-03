@@ -9,9 +9,11 @@ use futures::{sink::SinkExt, stream::StreamExt};
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
+use std::time::{Duration, Instant};
+use log::{info, warn};
 
 // JWT Claims structure (reused from auth)
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,6 +83,37 @@ pub struct UserConnection {
     pub tx: broadcast::Sender<WsMessage>,
 }
 
+// Each channel gets an mpsc sender for batched state updates
+pub struct ChannelBroadcaster {
+    pub tx: mpsc::UnboundedSender<WsMessage>,
+}
+
+fn spawn_channel_broadcaster(channel: Arc<RwLock<VoiceChannel>>) -> ChannelBroadcaster {
+    let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+    let channel_clone = channel.clone();
+    tokio::spawn(async move {
+        let mut last_sent = Instant::now();
+        let mut pending: Option<WsMessage> = None;
+        loop {
+            tokio::select! {
+                Some(msg) = rx.recv() => {
+                    pending = Some(msg);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(BROADCAST_BATCH_MS)) => {
+                    if let Some(msg) = pending.take() {
+                        let channel = channel_clone.read().await;
+                        for user in channel.users.values() {
+                            let _ = user.tx.send(msg.clone());
+                        }
+                        last_sent = Instant::now();
+                    }
+                }
+            }
+        }
+    });
+    ChannelBroadcaster { tx }
+}
+
 // Voice channel state
 #[derive(Debug)]
 pub struct VoiceChannel {
@@ -88,20 +121,40 @@ pub struct VoiceChannel {
     pub name: String,
     pub users: HashMap<String, UserConnection>,
     pub tx: broadcast::Sender<WsMessage>,
+    pub broadcaster: ChannelBroadcaster,
+}
+
+// Helper to create a new channel with broadcaster
+fn create_voice_channel(channel_id: &str) -> Arc<RwLock<VoiceChannel>> {
+    let (tx, _) = broadcast::channel::<WsMessage>(100);
+    let channel = Arc::new(RwLock::new(VoiceChannel {
+        id: channel_id.to_string(),
+        name: format!("Voice Channel {}", channel_id),
+        users: HashMap::new(),
+        tx,
+        broadcaster: ChannelBroadcaster { tx: mpsc::unbounded_channel().0 }, // placeholder, will be replaced
+    }));
+    // Now spawn the broadcaster and set it
+    let broadcaster = spawn_channel_broadcaster(channel.clone());
+    {
+        let mut channel_mut = futures::executor::block_on(channel.write());
+        channel_mut.broadcaster = broadcaster;
+    }
+    channel
 }
 
 // App state for WebSocket connections
 #[derive(Clone)]
 pub struct WsAppState {
-    pub connections: Arc<Mutex<HashMap<String, UserConnection>>>,
-    pub channels: Arc<Mutex<HashMap<String, VoiceChannel>>>,
+    pub connections: Arc<RwLock<HashMap<String, UserConnection>>>,
+    pub channels: Arc<RwLock<HashMap<String, VoiceChannel>>>,
 }
 
 impl WsAppState {
     pub fn new() -> Self {
         Self {
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            channels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -111,6 +164,10 @@ impl WsAppState {
 pub struct WsQuery {
     token: String,
 }
+
+// --- Per-channel batching infrastructure ---
+const BROADCAST_BATCH_MS: u64 = 50;
+const USER_MSG_RATE_LIMIT: usize = 20; // max messages per second
 
 // WebSocket handler
 pub async fn ws_handler(
@@ -167,6 +224,9 @@ async fn handle_ws_connection(
 
     // Create broadcast channel for this user
     let (tx, mut rx) = broadcast::channel::<WsMessage>(100);
+    // Add per-user rate limiter
+    let mut msg_count = 0usize;
+    let mut last_msg_time = Instant::now();
     
     // Store user connection
     let user_connection = UserConnection {
@@ -179,7 +239,8 @@ async fn handle_ws_connection(
     };
 
     {
-        let mut connections = state.connections.lock().unwrap();
+        // Use write lock for connections
+        let mut connections = state.connections.write().await;
         connections.insert(user_id.clone(), user_connection);
     }
 
@@ -202,6 +263,21 @@ async fn handle_ws_connection(
             msg = socket_rx.0.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        // Rate limiting: max USER_MSG_RATE_LIMIT per second
+                        let now = Instant::now();
+                        if now.duration_since(last_msg_time) > Duration::from_secs(1) {
+                            msg_count = 0;
+                            last_msg_time = now;
+                        }
+                        msg_count += 1;
+                        if msg_count > USER_MSG_RATE_LIMIT {
+                            warn!("User {} exceeded rate limit", user_id);
+                            let error_msg = WsMessage::Error { message: "Rate limit exceeded".to_string() };
+                            if let Ok(msg) = serde_json::to_string(&error_msg) {
+                                let _ = socket_tx.send(Message::Text(msg)).await;
+                            }
+                            continue;
+                        }
                         if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                             if let Err(_) = handle_ws_message(ws_msg, &user_id, &state).await {
                                 break;
@@ -274,19 +350,14 @@ async fn join_voice_channel(
     channel_id: &str,
     state: &WsAppState,
 ) -> Result<(), ()> {
-    let mut channels = state.channels.lock().unwrap();
-    let mut connections = state.connections.lock().unwrap();
+    let mut channels = state.channels.write().await;
+    let mut connections = state.connections.write().await;
 
-    // Get or create channel
-    let channel = channels.entry(channel_id.to_string()).or_insert_with(|| {
-        let (tx, _) = broadcast::channel::<WsMessage>(100);
-        VoiceChannel {
-            id: channel_id.to_string(),
-            name: format!("Voice Channel {}", channel_id),
-            users: HashMap::new(),
-            tx,
-        }
-    });
+    // Use Arc<RwLock<VoiceChannel>> for channel batching
+    let channel_arc = channels.entry(channel_id.to_string()).or_insert_with(|| {
+        create_voice_channel(channel_id)
+    }).clone();
+    let mut channel = channel_arc.write().await;
 
     // Get user connection
     let user_connection = connections
@@ -297,7 +368,7 @@ async fn join_voice_channel(
     if let Some(current_channel_id) = &user_connection.channel_id {
         if let Some(current_channel) = channels.get_mut(current_channel_id) {
             current_channel.users.remove(user_id);
-            broadcast_user_left(current_channel, user_id).await;
+            broadcast_user_left(&mut *current_channel, user_id).await;
         }
     }
 
@@ -322,9 +393,8 @@ async fn join_voice_channel(
         is_muted: user_connection.is_muted,
     };
 
-    if let Ok(msg_str) = serde_json::to_string(&join_msg) {
-        let _ = channel.tx.send(join_msg);
-    }
+    // Send join message via broadcaster (batched)
+    let _ = channel.broadcaster.tx.send(join_msg);
 
     // Send channel info to joining user
     let channel_users: Vec<UserInfo> = channel
@@ -343,17 +413,16 @@ async fn join_voice_channel(
         users: channel_users,
     };
 
-    if let Ok(msg_str) = serde_json::to_string(&channel_info) {
-        let _ = user_connection.tx.send(channel_info);
-    }
+    // Send channel info directly to joining user (not batched)
+    let _ = user_connection.tx.send(channel_info);
 
     Ok(())
 }
 
 // Leave voice channel
 async fn leave_voice_channel(user_id: &str, state: &WsAppState) -> Result<(), ()> {
-    let mut channels = state.channels.lock().unwrap();
-    let mut connections = state.connections.lock().unwrap();
+    let mut channels = state.channels.write().await;
+    let mut connections = state.connections.write().await;
 
     let user_connection = connections
         .get_mut(user_id)
@@ -362,7 +431,7 @@ async fn leave_voice_channel(user_id: &str, state: &WsAppState) -> Result<(), ()
     if let Some(channel_id) = &user_connection.channel_id {
         if let Some(channel) = channels.get_mut(channel_id) {
             channel.users.remove(user_id);
-            broadcast_user_left(channel, user_id).await;
+            broadcast_user_left(&mut *channel, user_id).await;
         }
         user_connection.channel_id = None;
     }
@@ -376,8 +445,8 @@ async fn set_user_mute_state(
     is_muted: bool,
     state: &WsAppState,
 ) -> Result<(), ()> {
-    let mut channels = state.channels.lock().unwrap();
-    let mut connections = state.connections.lock().unwrap();
+    let mut channels = state.channels.write().await;
+    let mut connections = state.connections.write().await;
 
     let user_connection = connections
         .get_mut(user_id)
@@ -391,15 +460,12 @@ async fn set_user_mute_state(
                 channel_user.is_muted = is_muted;
             }
 
-            // Broadcast state update
+            // Broadcast state update (batched)
             let state_msg = WsMessage::UserStateUpdate {
                 user_id: user_id.to_string(),
                 is_muted,
             };
-
-            if let Ok(msg_str) = serde_json::to_string(&state_msg) {
-                let _ = channel.tx.send(state_msg);
-            }
+            let _ = channel.broadcaster.tx.send(state_msg);
         }
     }
 
@@ -407,20 +473,18 @@ async fn set_user_mute_state(
 }
 
 // Broadcast user left message
-async fn broadcast_user_left(channel: &VoiceChannel, user_id: &str) {
+async fn broadcast_user_left(channel: &mut VoiceChannel, user_id: &str) {
     let left_msg = WsMessage::UserLeft {
         user_id: user_id.to_string(),
     };
-
-    if let Ok(msg_str) = serde_json::to_string(&left_msg) {
-        let _ = channel.tx.send(left_msg);
-    }
+    // Send via broadcaster (batched)
+    let _ = channel.broadcaster.tx.send(left_msg);
 }
 
 // Cleanup user connection on disconnect
 async fn cleanup_user_connection(user_id: &str, state: &WsAppState) {
-    let mut channels = state.channels.lock().unwrap();
-    let mut connections = state.connections.lock().unwrap();
+    let mut channels = state.channels.write().await;
+    let mut connections = state.connections.write().await;
 
     // Remove from connections
     let user_connection = connections.remove(user_id);
@@ -428,12 +492,14 @@ async fn cleanup_user_connection(user_id: &str, state: &WsAppState) {
     if let Some(connection) = user_connection {
         // Remove from channel
         if let Some(channel_id) = connection.channel_id {
-            if let Some(channel) = channels.get_mut(&channel_id) {
+            if let Some(channel_arc) = channels.get_mut(&channel_id) {
+                let mut channel = channel_arc.write().await;
                 channel.users.remove(user_id);
-                broadcast_user_left(channel, user_id).await;
+                broadcast_user_left(&mut *channel, user_id).await;
                 
-                // Remove empty channels
+                // Remove empty channels and drop broadcaster
                 if channel.users.is_empty() {
+                    // Dropping the Arc will stop the broadcaster task
                     channels.remove(&channel_id);
                 }
             }
@@ -450,4 +516,10 @@ pub async fn handle_audio_packet(
     // TODO: Implement UDP audio packet forwarding
     // This will be implemented in a future update
     // For now, this is a placeholder for the audio handling system
-} 
+}
+
+// TODO: Integrate ChannelBroadcaster into join_voice_channel, leave_voice_channel, and state update broadcasts.
+// TODO: Add metrics for dropped messages, rate limit violations, and broadcast latency.
+
+// TODO: Insert rate limiting and profiling hooks here (e.g., count messages per user, log slow/busy locks)
+// TODO: Add metrics/logging integration for dropped messages, lock contention, and message rates 

@@ -7,8 +7,11 @@ import useVoiceWebSocket, { UserState, ConnectionStatus } from "@/hooks/useVoice
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Mic, MicOff, Loader2, UserPlus, Shield } from "lucide-react";
+import { Mic, MicOff, Loader2, UserPlus, Shield, Settings } from "lucide-react";
 import { useUdpVoiceStream, UdpConnectionStatus } from '../hooks/useUdpVoiceStream';
+import React, { useMemo, useCallback, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
+import { UdpVoiceControls } from './UdpVoiceControls';
 
 // Dummy function to get JWT (replace with real auth)
 const getJwtToken = () => localStorage.getItem("jwt") || "";
@@ -17,7 +20,7 @@ const getJwtToken = () => localStorage.getItem("jwt") || "";
 const getCurrentUserId = () => localStorage.getItem("userId") || "current-user";
 
 // Dummy function to fetch channels (replace with real API)
-const fetchChannels = async () => [
+const fetchChannels = async (): Promise<Array<{ id: string; name: string; privacy: "public" | "private" | "invite_only"; userRole: "owner" | "moderator" | "member" | null }>> => [
   { id: "1", name: "General", privacy: "public", userRole: "member" },
   { id: "2", name: "Officers", privacy: "private", userRole: null },
   { id: "3", name: "Fleet Command", privacy: "invite_only", userRole: null },
@@ -55,14 +58,10 @@ const banUser = async (channelId: string, userId: string, reason?: string) => {
   // Simulate API call
 };
 
-const VoiceChannelManager: React.FC = () => {
+// 1. React.memo for pure components
+const VoiceChannelManager = React.memo(function VoiceChannelManager() {
   // State
-  const [channels, setChannels] = React.useState<{
-    id: string;
-    name: string;
-    privacy: "public" | "private" | "invite_only";
-    userRole: "owner" | "moderator" | "member" | null;
-  }[]>([]);
+  const [channels, setChannels] = useState<Array<{ id: string; name: string; privacy: "public" | "private" | "invite_only"; userRole: "owner" | "moderator" | "member" | null }>>([]);
   const [joinedChannelId, setJoinedChannelId] = React.useState<string | null>(null);
   const [showJoinTokenModal, setShowJoinTokenModal] = React.useState(false);
   const [pendingJoinChannelId, setPendingJoinChannelId] = React.useState<string | null>(null);
@@ -84,6 +83,10 @@ const VoiceChannelManager: React.FC = () => {
   // Role management state
   const [showRolePanel, setShowRolePanel] = React.useState(false);
   const [roleError, setRoleError] = React.useState<string | null>(null);
+
+  // Add settingsOpen and loading state
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [loading, setLoading] = useState(false); // Use this for shimmer
 
   const jwtToken = getJwtToken();
   const currentUserId = getCurrentUserId();
@@ -367,6 +370,20 @@ const VoiceChannelManager: React.FC = () => {
     }
   };
 
+  // 2. Memoize derived lists and handlers
+  const memoizedUserList = useMemo(() => userList, [userList]);
+  const handleMemoizedMute = useCallback(handleToggleMute, [handleToggleMute]);
+
+  // 3. Throttle/debounce UI events
+  function useDebouncedCallback<T extends (...args: any[]) => void>(fn: T, delay: number) {
+    const timeout = React.useRef<number | null>(null);
+    return useCallback((...args: Parameters<T>) => {
+      if (timeout.current) window.clearTimeout(timeout.current);
+      timeout.current = window.setTimeout(() => fn(...args), delay);
+    }, [fn, delay]);
+  }
+  const debouncedHandleMute = useDebouncedCallback(handleToggleMute, 30);
+
   // Render user list for joined channel
   const renderUserList = () => (
     <Card className="mt-6">
@@ -468,9 +485,9 @@ const VoiceChannelManager: React.FC = () => {
                 <span className="flex items-center gap-2">
                   <span className="font-medium">{user.username}</span>
                   {user.is_muted ? (
-                    <Badge variant="destructive">Muted</Badge>
+                    <span className="badge bg-destructive">Muted</span>
                   ) : (
-                    <Badge variant="default">Unmuted</Badge>
+                    <span className="badge bg-default">Unmuted</span>
                   )}
                 </span>
                 <Button
@@ -554,65 +571,109 @@ const VoiceChannelManager: React.FC = () => {
   );
 
   return (
-    <div className="max-w-3xl mx-auto p-4">
-      <div className="mb-4 flex items-center gap-4">
-        <span className="font-semibold">Connections:</span>
-        <div className="flex gap-2">
-          <Badge variant={
-            connectionStatus === "open"
-              ? "default"
-              : connectionStatus === "connecting"
-              ? "secondary"
-              : connectionStatus === "error"
-              ? "destructive"
-              : "outline"
-          }>
-            WebSocket: {connectionStatus.charAt(0).toUpperCase() + connectionStatus.slice(1)}
-          </Badge>
-          {joinedChannelId && (
-            <Badge variant={
-              audioState.status === UdpConnectionStatus.Connected
-                ? "default"
-                : audioState.status === UdpConnectionStatus.Connecting
-                ? "secondary"
-                : audioState.status === UdpConnectionStatus.Error
-                ? "destructive"
-                : "outline"
-            }>
-              UDP: {audioState.status.charAt(0).toUpperCase() + audioState.status.slice(1)}
-            </Badge>
+    <div className="relative min-h-screen w-full bg-gradient-to-br from-zinc-900/80 via-zinc-800/80 to-zinc-900/90 backdrop-blur-xl">
+      <div className="flex flex-col md:flex-row gap-6 p-4 md:p-8">
+        <motion.div
+          initial={{ opacity: 0, y: 24 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: 24 }}
+          transition={{ duration: 0.4, type: 'spring' }}
+          className="flex-1 max-w-2xl mx-auto bg-white/70 dark:bg-zinc-900/80 rounded-xl shadow-2xl p-6 backdrop-blur-lg border border-border"
+        >
+          <div className="mb-4 flex items-center gap-4">
+            <span className="font-semibold">Connections:</span>
+            <div className="flex gap-2">
+              <Badge className={
+                connectionStatus === "open"
+                  ? "bg-default"
+                  : connectionStatus === "connecting"
+                  ? "bg-secondary"
+                  : connectionStatus === "error"
+                  ? "bg-destructive"
+                  : "bg-outline"
+              }>
+                WebSocket: {connectionStatus.charAt(0).toUpperCase() + connectionStatus.slice(1)}
+              </Badge>
+              {joinedChannelId && (
+                <Badge className={
+                  audioState.status === UdpConnectionStatus.Connected
+                    ? "bg-default"
+                    : audioState.status === UdpConnectionStatus.Connecting
+                    ? "bg-secondary"
+                    : audioState.status === UdpConnectionStatus.Error
+                    ? "bg-destructive"
+                    : "bg-outline"
+                }>
+                  UDP: {audioState.status.charAt(0).toUpperCase() + audioState.status.slice(1)}
+                </Badge>
+              )}
+            </div>
+            {(wsError || audioState.error) && (
+              <span className="text-destructive text-sm ml-2">
+                {wsError || audioState.error}
+              </span>
+            )}
+          </div>
+          <ChannelList
+            channels={channels}
+            onJoin={handleJoin}
+            onLeave={handleLeave}
+            onRequestJoinToken={handleRequestJoinToken}
+            joinedChannelId={joinedChannelId}
+            setJoinedChannelId={setJoinedChannelId}
+          />
+          {joinError && (
+            <div className="mt-4 text-destructive text-sm" role="alert">{joinError}</div>
           )}
-        </div>
-        {(wsError || audioState.error) && (
-          <span className="text-destructive text-sm ml-2">
-            {wsError || audioState.error}
-          </span>
-        )}
+          {joinLoading && (
+            <div className="mt-4 flex items-center gap-2 text-muted-foreground text-sm">
+              <Loader2 className="h-4 w-4 animate-spin" /> Joining channel...
+            </div>
+          )}
+          {joinedChannelId && renderUserList()}
+          <JoinTokenModal
+            visible={showJoinTokenModal}
+            onSubmit={handleSubmitJoinToken}
+            onCancel={handleCancelJoinToken}
+          />
+        </motion.div>
+        <motion.div
+          initial={{ opacity: 0, x: 24 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: 24 }}
+          transition={{ duration: 0.4, type: 'spring' }}
+          className="w-full md:w-[400px] max-w-full mx-auto md:mx-0 bg-white/70 dark:bg-zinc-900/80 rounded-xl shadow-2xl p-6 backdrop-blur-lg border border-border"
+        >
+          <div className="relative">
+            <UdpVoiceControls
+              jwtToken={jwtToken}
+              userId={currentUserId}
+              channelId={joinedChannelId || ''}
+              serverAddress={'127.0.0.1'}
+              serverPort={8080}
+            />
+            <button
+              className="fixed md:absolute bottom-6 right-6 z-50 bg-primary text-white rounded-full p-3 shadow-lg hover:scale-105 focus:ring-2 focus:ring-primary/50 transition-all"
+              aria-label="Open settings"
+              onClick={() => setSettingsOpen(true)}
+            >
+              <Settings className="h-6 w-6" />
+            </button>
+          </div>
+        </motion.div>
       </div>
-      <ChannelList
-        channels={channels}
-        onJoin={handleJoin}
-        onLeave={handleLeave}
-        onRequestJoinToken={handleRequestJoinToken}
-        joinedChannelId={joinedChannelId}
-        setJoinedChannelId={setJoinedChannelId}
-      />
-      {joinError && (
-        <div className="mt-4 text-destructive text-sm" role="alert">{joinError}</div>
-      )}
-      {joinLoading && (
-        <div className="mt-4 flex items-center gap-2 text-muted-foreground text-sm">
-          <Loader2 className="h-4 w-4 animate-spin" /> Joining channel...
-        </div>
-      )}
-      {joinedChannelId && renderUserList()}
-      <JoinTokenModal
-        visible={showJoinTokenModal}
-        onSubmit={handleSubmitJoinToken}
-        onCancel={handleCancelJoinToken}
-      />
+      <AnimatePresence>
+        {loading && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 bg-gradient-to-br from-primary/10 to-secondary/10 animate-pulse z-40"
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
-};
+});
 
 export default VoiceChannelManager; 
