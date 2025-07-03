@@ -1,7 +1,6 @@
-import * as React from "react";
 import ChannelList from "./ChannelList";
 import JoinTokenModal from "./JoinTokenModal";
-import InviteUserPanel from "./InviteUserPanel";
+import { InviteUserPanel } from "./InviteUserPanel";
 import RoleManagementPanel from "./RoleManagementPanel";
 import useVoiceWebSocket, { UserState, ConnectionStatus } from "@/hooks/useVoiceWebSocket";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
